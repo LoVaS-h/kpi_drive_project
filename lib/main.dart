@@ -2,82 +2,81 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'api_service.dart';
 import 'cubit/cubit.dart';
 import 'dart:async';
 
+import 'task_repository/export.dart';
+
+// Менеджер для автоматического скролла при перетаскивании карточек (Drag-and-Drop).
+// Позволяет доске прокручиваться, если карточка поднесена к краю экрана.
 class DragScrollManager {
+  // Реализация Singleton для доступа к менеджеру из любой части приложения.
   static final DragScrollManager instance = DragScrollManager._internal();
   DragScrollManager._internal();
 
+  // Контроллер для горизонтальной прокрутки всей доски.
   ScrollController? horizontalController;
-  Map<int, ScrollController> verticalControllers = {};
-  Map<int, RenderBox?> verticalBoxes = {};
+  // Мапа контроллеров для вертикальной прокрутки каждой отдельной колонки (по ID папки).
+  final Map<int, ScrollController> verticalControllers = {};
+  // Хранилище RenderBox колонок для определения их границ в глобальных координатах.
+  final Map<int, RenderBox?> verticalBoxes = {};
 
   Timer? _timer;
   Offset? _lastPosition;
   Size? _screenSize;
 
+  // Обновляет текущую позицию перетаскиваемого объекта и запускает таймер скролла (60 FPS).
   void updatePosition(Offset position, Size screenSize) {
     _lastPosition = position;
     _screenSize = screenSize;
     _timer ??= Timer.periodic(const Duration(milliseconds: 16), _scrollTick);
   }
 
+  // Останавливает скролл и полностью сбрасывает таймер при завершении Drag-события.
   void endDrag() {
     _timer?.cancel();
     _timer = null;
     _lastPosition = null;
   }
 
+  // Циклическая проверка необходимости сдвига контроллеров.
   void _scrollTick(Timer timer) {
     if (_lastPosition == null || _screenSize == null) return;
     final pos = _lastPosition!;
     final size = _screenSize!;
 
-    
-    if (horizontalController != null && horizontalController!.hasClients) {
-      double dx = 0;
-      if (pos.dx < 100) {
-        dx = -10; 
-      } else if (pos.dx > size.width - 100){
-        dx = 10;
-      } 
-      
-      if (dx != 0) {
-        final newOffset = horizontalController!.offset + dx;
-        horizontalController!.jumpTo(newOffset.clamp(
-          horizontalController!.position.minScrollExtent,
-          horizontalController!.position.maxScrollExtent,
-        ));
-      }
-    }
+    // Вызов проверки для горизонтального скролла всей доски.
+    _scrollIfNeeded(horizontalController, pos.dx, size.width);
 
-    
+    // Перебор всех колонок для поиска той, над которой сейчас находится карточка.
     for (var entry in verticalBoxes.entries) {
-      final folderId = entry.key;
       final box = entry.value;
       if (box != null && box.attached) {
         try {
+          // Перевод глобальной позиции касания в локальную позицию внутри колонки.
           final localPos = box.globalToLocal(pos);
+          // Если касание внутри текущей колонки по ширине — скроллим её вертикально.
           if (localPos.dx >= 0 && localPos.dx <= box.size.width) {
-            final vCtrl = verticalControllers[folderId];
-            if (vCtrl != null && vCtrl.hasClients) {
-              double dy = 0;
-              if (localPos.dy < 100 && localPos.dy > -50) dy = -10; 
-              else if (localPos.dy > box.size.height - 100 && localPos.dy < box.size.height + 50) dy = 10; 
-
-              if (dy != 0) {
-                final newOffset = vCtrl.offset + dy;
-                vCtrl.jumpTo(newOffset.clamp(
-                  vCtrl.position.minScrollExtent,
-                  vCtrl.position.maxScrollExtent,
-                ));
-              }
-            }
+            _scrollIfNeeded(verticalControllers[entry.key], localPos.dy, box.size.height, extraPadding: 50);
             break; 
           }
-        } catch (e) { }
+        } catch (_) {}
+      }
+    }
+  }
+
+  // Универсальная логика расчета: если объект у края (100px), двигаем offset контроллера.
+  void _scrollIfNeeded(ScrollController? ctrl, double currentPos, double maxPos, {double extraPadding = 0}) {
+    if (ctrl != null && ctrl.hasClients) {
+      double d = 0;
+      // Если близко к левому/верхнему краю.
+      if (currentPos < 100 && currentPos > -extraPadding) d = -10; 
+      // Если близко к правому/нижнему краю.
+      else if (currentPos > maxPos - 100 && currentPos < maxPos + extraPadding) d = 10; 
+
+      if (d != 0) {
+        // Выполняем мгновенный сдвиг (jumpTo) с ограничением по границам контента.
+        ctrl.jumpTo((ctrl.offset + d).clamp(ctrl.position.minScrollExtent, ctrl.position.maxScrollExtent));
       }
     }
   }
@@ -87,6 +86,7 @@ void main() {
   runApp(const KpiDriveApp());
 }
 
+// Корневой виджет приложения. Устанавливает темную тему и инициализирует Cubit.
 class KpiDriveApp extends StatelessWidget {
   const KpiDriveApp({super.key});
 
@@ -102,6 +102,7 @@ class KpiDriveApp extends StatelessWidget {
           brightness: Brightness.dark,
         ),
       ),
+      // Обертка BlocProvider для доступа к бизнес-логике управления задачами.
       home: BlocProvider(
         create: (context) => KanbanCubit(ApiService())..loadTasks(),
         child: const KanbanScreen(),
@@ -110,6 +111,7 @@ class KpiDriveApp extends StatelessWidget {
   }
 }
 
+// Главный экран Kanban-доски.
 class KanbanScreen extends StatefulWidget {
   const KanbanScreen({super.key});
 
@@ -118,11 +120,13 @@ class KanbanScreen extends StatefulWidget {
 }
 
 class _KanbanScreenState extends State<KanbanScreen> {
+  // Основной контроллер для горизонтального перемещения между колонками.
   final ScrollController _horizontalController = ScrollController();
 
   @override
   void initState() {
     super.initState();
+    // Связываем локальный контроллер с глобальным менеджером автоскролла.
     DragScrollManager.instance.horizontalController = _horizontalController;
   }
 
@@ -142,11 +146,13 @@ class _KanbanScreenState extends State<KanbanScreen> {
           'KPI-DRIVE / KANBAN',
           style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 1.2, fontSize: 20, color: Colors.white),
         ),
+        // Нижняя граница шапки.
         shape: const Border(bottom: BorderSide(color: Color(0xFF222222), width: 1)),
         elevation: 0,
       ),
       body: Row(
         children: [
+          // Левый Sidebar для действий над всей доской (например, создание папок).
           Container(
             width: 64,
             decoration: const BoxDecoration(
@@ -167,6 +173,7 @@ class _KanbanScreenState extends State<KanbanScreen> {
               ],
             ),
           ),
+          // Основная область доски с обработкой состояний загрузки/ошибки.
           Expanded(
             child: BlocConsumer<KanbanCubit, KanbanState>(
               listener: (context, state) {
@@ -191,11 +198,13 @@ class _KanbanScreenState extends State<KanbanScreen> {
     );
   }
 
+  // Рендерит саму доску с горизонтальным скроллом и кастомным Scrollbar.
   Widget _buildBoard(BuildContext context, List<Task> tasks, Map<int, String> folders) {
     final folderIds = folders.keys.toList()..sort();
 
     return Container(
       decoration: const BoxDecoration(
+        // Дизайнерский градиент фона.
         gradient: RadialGradient(
           center: Alignment.topLeft,
           radius: 1.5,
@@ -203,6 +212,7 @@ class _KanbanScreenState extends State<KanbanScreen> {
         ),
       ),
       child: ScrollConfiguration(
+        // Позволяет скроллить мышкой и тачпадом на десктопе.
         behavior: ScrollConfiguration.of(context).copyWith(
           dragDevices: {PointerDeviceKind.touch, PointerDeviceKind.mouse, PointerDeviceKind.trackpad},
         ),
@@ -225,6 +235,7 @@ class _KanbanScreenState extends State<KanbanScreen> {
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: folderIds.map((folderId) {
+                // Фильтруем задачи для конкретной колонки.
                 final columnTasks = tasks.where((t) => t.parentId == folderId).toList();
                 return Package(
                   folderId: folderId,
@@ -241,6 +252,7 @@ class _KanbanScreenState extends State<KanbanScreen> {
   }
 }
 
+// Виджет колонки (папки). Управляет анимациями списка и вертикальным скроллом.
 class Package extends StatefulWidget {
   final int folderId;
   final String folderName;
@@ -260,8 +272,9 @@ class Package extends StatefulWidget {
 }
 
 class _PackageState extends State<Package> {
-  
+  // Ключ для управления AnimatedList (вставка/удаление с анимацией).
   final GlobalKey<AnimatedListState> _listKey = GlobalKey<AnimatedListState>();
+  // Ключ для получения размеров и позиции колонки.
   final GlobalKey _packageKey = GlobalKey();
   final ScrollController _verticalController = ScrollController();
   late List<Task> _currentTasks;
@@ -271,8 +284,9 @@ class _PackageState extends State<Package> {
     super.initState();
     _currentTasks = List.from(widget.tasks);
     
-    
+    // Регистрация контроллера колонки для системы автоскролла.
     DragScrollManager.instance.verticalControllers[widget.folderId] = _verticalController;
+    // Сохранение ссылки на RenderBox после отрисовки кадра.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         DragScrollManager.instance.verticalBoxes[widget.folderId] = 
@@ -283,16 +297,20 @@ class _PackageState extends State<Package> {
 
   @override
   void dispose() {
+    // Очистка ссылок в менеджере при удалении колонки.
     DragScrollManager.instance.verticalControllers.remove(widget.folderId);
     DragScrollManager.instance.verticalBoxes.remove(widget.folderId);
     _verticalController.dispose();
     super.dispose();
   }
 
+  // Метод отслеживания изменений в списке задач для запуска анимаций.
   @override
   void didUpdateWidget(covariant Package oldWidget) {
     super.didUpdateWidget(oldWidget);
     final newTasks = widget.tasks;
+    
+    // 1. Поиск и анимация удаления задач, которых больше нет в списке.
     for (int i = 0; i < _currentTasks.length; i++) {
       final task = _currentTasks[i];
       if (!newTasks.any((t) => t.id == task.id)) {
@@ -308,6 +326,7 @@ class _PackageState extends State<Package> {
         i--;
       }
     }
+    // 2. Поиск и анимация добавления новых задач.
     for (int i = 0; i < newTasks.length; i++) {
       final task = newTasks[i];
       if (!_currentTasks.any((t) => t.id == task.id)) {
@@ -318,6 +337,7 @@ class _PackageState extends State<Package> {
     _currentTasks = List.from(newTasks);
   }
 
+  // Вызов диалога для изменения имени папки.
   void _showRenameDialog(BuildContext context) {
     final controller = TextEditingController(text: widget.folderName);
     showDialog(
@@ -339,6 +359,7 @@ class _PackageState extends State<Package> {
     );
   }
 
+  // Вызов диалога подтверждения удаления папки.
   void _deleteFolder() {
     showDialog(
       context: context,
@@ -377,9 +398,10 @@ class _PackageState extends State<Package> {
         borderRadius: BorderRadius.circular(16),
         border: Border.all(color: const Color(0xFF222222), width: 1),
       ),
-      key: _packageKey,
+      key: _packageKey, // Привязка ключа для RenderBox.
       child: Column(
         children: [
+          // Шапка колонки (имя, редактирование, удаление).
           Padding(
             padding: const EdgeInsets.fromLTRB(20, 20, 20, 12),
             child: Row(
@@ -410,6 +432,7 @@ class _PackageState extends State<Package> {
               ],
             ),
           ),
+          // Кнопка для создания новой задачи в этой колонке.
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 12),
             child: InkWell(
@@ -438,15 +461,18 @@ class _PackageState extends State<Package> {
             ),
           ),
           const SizedBox(height: 5),
+          // Список задач с поддержкой DragTarget (прием падающих карточек).
           Flexible(
             child: DragTarget<Task>(
+              // Событие приземления карточки в самый низ колонки.
               onAccept: (task) {
-                final newOrder = widget.tasks.isEmpty ? 1 : widget.tasks.last.order + 1;
+                final int taskCount = widget.tasks.length;
+                final bool isSameFolder = task.parentId == widget.folderId;
+                final int newOrder = taskCount == 0 ? 1 : (isSameFolder ? taskCount : taskCount + 1);
                 context.read<KanbanCubit>().moveTask(task, widget.folderId, newOrder);
               },
               builder: (context, candidateData, rejectedData) {
                 final bool isHoveringAtEnd = candidateData.isNotEmpty;
-
                 return Column(
                   children: [
                     Expanded(
@@ -463,6 +489,7 @@ class _PackageState extends State<Package> {
                         },
                       ),
                     ),
+                    // Визуальный индикатор (пустое место) в конце списка при наведении.
                     AnimatedContainer(
                       duration: const Duration(milliseconds: 250),
                       height: isHoveringAtEnd ? 112 : 20,
@@ -490,17 +517,21 @@ class _PackageState extends State<Package> {
   }
 }
 
+// Создает обертку Draggable для карточки. Позволяет перетаскивать её и бросать в другие карточки.
 Widget _buildTaskCard(BuildContext context, Task task) {
   return LongPressDraggable<Task>(
     key: ValueKey(task.id),
     data: task,
+    // Уведомление менеджера автоскролла о перемещении пальца/курсора.
     onDragUpdate: (details) {
       final size = MediaQuery.of(context).size;
       DragScrollManager.instance.updatePosition(details.globalPosition, size);
     },
+    // Остановка автоскролла при отпускании.
     onDragEnd: (details) {
       DragScrollManager.instance.endDrag();
     },
+    // Вид карточки, который "летит" за пальцем.
     feedback: Material(
       color: Colors.transparent,
       child: SizedBox(
@@ -508,10 +539,13 @@ Widget _buildTaskCard(BuildContext context, Task task) {
         child: Opacity(opacity: 0.8, child: _TaskCardWidget(task: task, isDragging: true)),
       ),
     ),
+    // Вид карточки на старом месте во время перетаскивания (скрываем её).
     childWhenDragging: const SizedBox.shrink(), 
+    // Каждая карточка сама является целью для другой (DragTarget) для реализации вставки между ними.
     child: DragTarget<Task>(
       onWillAccept: (draggedTask) => draggedTask?.id != task.id,
       onAccept: (draggedTask) {
+        // Перемещаем перетаскиваемую задачу в позицию текущей задачи.
         context.read<KanbanCubit>().moveTask(draggedTask, task.parentId, task.order);
       },
       builder: (context, candidateData, rejectedData) {
@@ -519,6 +553,7 @@ Widget _buildTaskCard(BuildContext context, Task task) {
 
         return Column(
           children: [
+            // Анимированный отступ при наведении другой карточки "сверху".
             AnimatedContainer(
               duration: const Duration(milliseconds: 250),
               curve: Curves.easeInOut,
@@ -546,6 +581,7 @@ Widget _buildTaskCard(BuildContext context, Task task) {
   );
 }
 
+// Виджет визуального отображения задачи (дизайн карточки).
 class _TaskCardWidget extends StatefulWidget {
   final Task task;
   final bool isDragging;
@@ -557,8 +593,8 @@ class _TaskCardWidget extends StatefulWidget {
 }
 
 class _TaskCardWidgetState extends State<_TaskCardWidget> {
-  bool isFinished = false;
-  bool isEditing = false;
+  bool isFinished = false; // Статус выполнения.
+  bool isEditing = false; // Режим редактирования текста.
   late TextEditingController _textController;
 
   @override
@@ -577,14 +613,13 @@ class _TaskCardWidgetState extends State<_TaskCardWidget> {
   @override
   void didUpdateWidget(_TaskCardWidget oldWidget) {
     super.didUpdateWidget(oldWidget);
-    
-    
+    // Синхронизация текста, если задача изменилась извне (не во время печати).
     if (oldWidget.task.name != widget.task.name && !isEditing) {
       _textController.text = widget.task.name;
     }
   }
 
-  
+  // Загрузка состояния чекбокса из локального хранилища устройства.
   Future<void> _loadCheckboxState() async {
     final prefs = await SharedPreferences.getInstance();
     if (!mounted) return;
@@ -593,13 +628,14 @@ class _TaskCardWidgetState extends State<_TaskCardWidget> {
     });
   }
 
-  
+  // Сохранение и переключение состояния выполнения.
   Future<void> changeState() async { 
     setState(() { isFinished = !isFinished; }); 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('task_status_${widget.task.id}', isFinished);
   }
 
+  // Переключение режима правки текста и сохранение на сервер/в Cubit.
   void _handleEditTap() {
     if (isEditing) {
       final newName = _textController.text.trim();
@@ -615,8 +651,10 @@ class _TaskCardWidgetState extends State<_TaskCardWidget> {
     return Container(
       height: 102,
       decoration: BoxDecoration(
+        // Окрашиваем фон в зеленый при завершении задачи.
         color: isFinished ? const Color.fromARGB(255, 0, 53, 28) : const Color(0xFF1E1E1E),
         borderRadius: BorderRadius.circular(12),
+        // Синяя обводка при перетаскивании.
         border: Border.all(color: widget.isDragging ? Colors.blueAccent : const Color(0xFF2A2A2A), width: 1),
         boxShadow: widget.isDragging ? [BoxShadow(color: Colors.blueAccent.withOpacity(0.2), blurRadius: 15, spreadRadius: 2)] : [],
       ),
@@ -624,6 +662,7 @@ class _TaskCardWidgetState extends State<_TaskCardWidget> {
         borderRadius: BorderRadius.circular(12),
         child: Row(
           children: [
+            // Левая часть: название или текстовое поле.
             Expanded(
               child: Container(
                 decoration: BoxDecoration(
@@ -649,16 +688,19 @@ class _TaskCardWidgetState extends State<_TaskCardWidget> {
                 ),
               ),
             ),
+            // Кнопки действий.
             Column(
               children: [
+                // Кнопка статуса "Выполнено".
                 IconButton(onPressed: changeState, constraints: const BoxConstraints(), padding: const EdgeInsets.all(5), icon: isFinished ? const Icon(Icons.check_circle, color: Colors.green, size: 20) : const Icon(Icons.check_circle_outline, color: Colors.white24, size: 20)),
+                // Кнопка "Редактировать / Сохранить".
                 IconButton(
                   onPressed: _handleEditTap, 
                   constraints: const BoxConstraints(), 
                   padding: const EdgeInsets.all(5), 
                   icon: Icon(isEditing ? Icons.save : Icons.edit, size: 20, color: isEditing ? Colors.blueAccent : Colors.white24)
                 ),
-                
+                // Кнопка удаления задачи.
                 IconButton(
                   onPressed: () {
                     context.read<KanbanCubit>().deleteTask(widget.task.id);

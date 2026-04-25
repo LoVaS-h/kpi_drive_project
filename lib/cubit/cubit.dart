@@ -2,32 +2,9 @@ import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:equatable/equatable.dart';
-import '../api_service.dart';
+import '../task_repository/export.dart';
 
-abstract class KanbanState extends Equatable {
-  @override
-  List<Object> get props => [];
-}
-
-class KanbanLoading extends KanbanState {}
-
-class KanbanLoaded extends KanbanState {
-  final List<Task> tasks;
-  final Map<int, String> folders;
-  
-  KanbanLoaded(this.tasks, this.folders);
-
-  @override
-  List<Object> get props => [tasks, folders];
-}
-
-class KanbanError extends KanbanState {
-  final String message;
-  KanbanError(this.message);
-  
-  @override
-  List<Object> get props => [message];
-}
+part 'states.dart';
 
 class KanbanCubit extends Cubit<KanbanState> {
   final ApiService apiService;
@@ -38,294 +15,248 @@ class KanbanCubit extends Cubit<KanbanState> {
 
   static const String _storageKey = 'custom_folder_names';
   static const String _localTasksKey = 'local_tasks';
-
   
+  // Получение экземпляра локального хранилища
+  Future<SharedPreferences> get _prefs => SharedPreferences.getInstance();
+
+  // Вспомогательный метод для обновления UI текущими данными
+  void _emitLoaded() => emit(KanbanLoaded(List.from(_cachedTasks), Map.from(_folders)));
+
+  // Загрузка кастомных имен папок из памяти устройства
+  Future<Map<String, dynamic>> _getSavedFolders() async {
+    final savedRaw = (await _prefs).getString(_storageKey);
+    return savedRaw != null ? jsonDecode(savedRaw) : {};
+  }
+
+  // Сохранение кастомных имен папок в память устройства
+  Future<void> _updateSavedFolders(Map<String, dynamic> data) async {
+    (await _prefs).setString(_storageKey, jsonEncode(data));
+  }
+
+  // Сохранение локально созданных задач (с отрицательными ID) в память
   Future<void> _saveLocalTasks() async {
-    final prefs = await SharedPreferences.getInstance();
     final localTasks = _cachedTasks.where((t) => t.id < 0).map((t) => {
       'indicator_to_mo_id': t.id,
       'parent_id': t.parentId,
       'name': t.name,
       'order': t.order,
     }).toList();
-    await prefs.setString(_localTasksKey, jsonEncode(localTasks));
+    (await _prefs).setString(_localTasksKey, jsonEncode(localTasks));
   }
 
+  // Инициализация данных: загрузка с сервера + локальный кэш + имена папок
   Future<void> loadTasks() async {
     try {
       emit(KanbanLoading());
       _cachedTasks = await apiService.fetchTasks();
       
-      final prefs = await SharedPreferences.getInstance();
-
-      
+      final prefs = await _prefs;
       final String? localTasksRaw = prefs.getString(_localTasksKey);
+      
       if (localTasksRaw != null) {
         final List<dynamic> localTasksList = jsonDecode(localTasksRaw);
-        _cachedTasks.addAll(localTasksList.map((json) => Task.fromJson(json)));
+        _cachedTasks.addAll(localTasksList.map((j) => Task.fromJson(j)));
       }
 
-      
-      final String? savedNamesRaw = prefs.getString(_storageKey);
-      Map<String, dynamic> savedNames = savedNamesRaw != null ? jsonDecode(savedNamesRaw) : {};
+      final savedNames = await _getSavedFolders();
 
-      
-      final Set<int> uniquePids = _cachedTasks.map((t) => t.parentId).toSet();
-      for (var key in savedNames.keys) {
-        uniquePids.add(int.parse(key));
-      }
-      
-      final List<int> sortedPids = uniquePids.toList()..sort();
+      final uniquePids = {..._cachedTasks.map((t) => t.parentId), ...savedNames.keys.map(int.parse)}.toList()..sort();
 
+      _folders = {
+        for (int i = 0; i < uniquePids.length; i++)
+          uniquePids[i]: savedNames[uniquePids[i].toString()] ?? 'Папка ${i + 1}'
+      };
       
-      final Map<int, String> autoFolders = {};
-      for (int i = 0; i < sortedPids.length; i++) {
-        int pid = sortedPids[i];
-        if (savedNames.containsKey(pid.toString())) {
-          autoFolders[pid] = savedNames[pid.toString()];
-        } else {
-          autoFolders[pid] = 'Папка ${i + 1}';
-        }
-      }
-      
-      _folders = autoFolders;
       _cachedTasks.sort((a, b) => a.order.compareTo(b.order));
-      
-      emit(KanbanLoaded(List.from(_cachedTasks), Map.from(_folders)));
+      _emitLoaded();
     } catch (e) {
       emit(KanbanError("Ошибка загрузки задач: $e"));
     }
   }
 
-
-
+  // Локальное переименование папки (колонки)
   Future<void> renameFolder(int folderId, String newName) async {
     try {
       _folders[folderId] = newName;
-      emit(KanbanLoaded(List.from(_cachedTasks), Map.from(_folders)));
+      _emitLoaded();
 
-      final prefs = await SharedPreferences.getInstance();
-      final String? savedNamesRaw = prefs.getString(_storageKey);
-      Map<String, dynamic> savedNames = savedNamesRaw != null ? jsonDecode(savedNamesRaw) : {};
-      
+      final savedNames = await _getSavedFolders();
       savedNames[folderId.toString()] = newName;
-      await prefs.setString(_storageKey, jsonEncode(savedNames));
+      await _updateSavedFolders(savedNames);
     } catch (e) {
       emit(KanbanError("Не удалось сохранить название папки"));
     }
   }
 
-  Future<void> deleteTask(int taskId) async {
-    final previousTasks = List<Task>.from(_cachedTasks);
+  // Локальное удаление папки и всех задач внутри неё
+  Future<void> deleteFolder(int folderId) async {
     try {
-      _cachedTasks.removeWhere((t) => t.id == taskId);
-      emit(KanbanLoaded(List.from(_cachedTasks), Map.from(_folders)));
-      
-      
-      if (taskId < 0) {
-        await _saveLocalTasks();
-        return;
-      }
+      _folders.remove(folderId);
+      _cachedTasks.removeWhere((t) => t.parentId == folderId);
+      _emitLoaded();
 
-      final success = await apiService.deleteTask(taskId);
-      if (!success) {
-        _cachedTasks = previousTasks;
-        emit(KanbanError("Не удалось удалить на сервере."));
-        emit(KanbanLoaded(List.from(_cachedTasks), Map.from(_folders)));
+      final savedNames = await _getSavedFolders();
+      if (savedNames.remove(folderId.toString()) != null) {
+        await _updateSavedFolders(savedNames);
       }
+      await _saveLocalTasks();
     } catch (e) {
-      _cachedTasks = previousTasks;
-      emit(KanbanError("Сбой при удалении."));
-      emit(KanbanLoaded(List.from(_cachedTasks), Map.from(_folders)));
+      emit(KanbanError("Ошибка при удалении папки"));
     }
   }
 
-  Future<void> addFolder(String name) async {
-    final previousFolders = Map<int, String>.from(_folders);
-    try {
-      
-      final tempId = -DateTime.now().millisecondsSinceEpoch;
-      
-      _folders = {tempId: name, ..._folders};
-      emit(KanbanLoaded(List.from(_cachedTasks), Map.from(_folders)));
-
-      
-      final prefs = await SharedPreferences.getInstance();
-      final String? savedNamesRaw = prefs.getString(_storageKey);
-      Map<String, dynamic> savedNames = savedNamesRaw != null ? jsonDecode(savedNamesRaw) : {};
-      savedNames[tempId.toString()] = name;
-      await prefs.setString(_storageKey, jsonEncode(savedNames));
-
-    } catch (e) {
-      _folders = previousFolders;
-      emit(KanbanError('Ошибка в создании папки'));
-      emit(KanbanLoaded(List.from(_cachedTasks), Map.from(_folders)));
-    }
-  }
-
-  Future<void> moveTask(Task task, int newParentId, int newOrder) async { 
-    final previousTasks = List<Task>.from(_cachedTasks); 
-    final oldParentId = task.parentId; 
-    final oldOrder = task.order; 
-
-    int maxOrderInTarget = _cachedTasks.where((t) => t.parentId == newParentId).length; 
-    if (oldParentId != newParentId) maxOrderInTarget += 1; 
-    if (newOrder > maxOrderInTarget) newOrder = maxOrderInTarget; 
-
-    if (oldParentId == newParentId && oldOrder == newOrder) return; 
-
-    try {
-      List<Task> tasksToUpdateOnServer = []; 
-      _cachedTasks.removeWhere((t) => t.id == task.id); 
-
-      int finalNewOrder = newOrder;
-
-      
-      if (oldParentId == newParentId) { 
-        if (oldOrder < newOrder) {
-          
-          
-          finalNewOrder = newOrder - 1;
-          for (int i = 0; i < _cachedTasks.length; i++) {
-            var t = _cachedTasks[i];
-            if (t.parentId == oldParentId && t.order > oldOrder && t.order < newOrder) {
-              _cachedTasks[i] = t.copyWith(order: t.order - 1);
-              tasksToUpdateOnServer.add(_cachedTasks[i]);
-            }
-          }
-        } else {
-          
-          finalNewOrder = newOrder;
-          for (int i = 0; i < _cachedTasks.length; i++) {
-            var t = _cachedTasks[i];
-            if (t.parentId == oldParentId && t.order >= newOrder && t.order < oldOrder) {
-              _cachedTasks[i] = t.copyWith(order: t.order + 1);
-              tasksToUpdateOnServer.add(_cachedTasks[i]);
-            }
-          }
-        }
-      } else { 
-        
-        finalNewOrder = newOrder;
-        for (int i = 0; i < _cachedTasks.length; i++) { 
-          var t = _cachedTasks[i]; 
-          if (t.parentId == oldParentId && t.order > oldOrder) { 
-            _cachedTasks[i] = t.copyWith(order: t.order - 1); 
-            tasksToUpdateOnServer.add(_cachedTasks[i]); 
-          } else if (t.parentId == newParentId && t.order >= newOrder) { 
-            _cachedTasks[i] = t.copyWith(order: t.order + 1); 
-            tasksToUpdateOnServer.add(_cachedTasks[i]); 
-          }
-        }
-      }
-
-      final updatedTask = task.copyWith(parentId: newParentId, order: finalNewOrder); 
-      _cachedTasks.add(updatedTask); 
-      tasksToUpdateOnServer.add(updatedTask); 
-
-      _cachedTasks.sort((a, b) => a.order.compareTo(b.order)); 
-      emit(KanbanLoaded(List.from(_cachedTasks), Map.from(_folders)));
-
-      
-      for (var t in tasksToUpdateOnServer) { 
-        if (t.id < 0) continue; 
-
-        if (t.id == task.id) { 
-          if (oldParentId != newParentId) { 
-            await apiService.saveTaskField(t.id, 'parent_id', newParentId); 
-          }
-          await apiService.saveTaskField(t.id, 'order', finalNewOrder); 
-        } else { 
-          await apiService.saveTaskField(t.id, 'order', t.order); 
-        }
-      }
-      await _saveLocalTasks(); 
-    } catch (e) { 
-      _cachedTasks = previousTasks; 
-      emit(KanbanError("Сбой синхронизации. Изменения порядков отменены.")); 
-      emit(KanbanLoaded(List.from(_cachedTasks), Map.from(_folders)));
-    }
-  }
-
-  Future<void> taskSave(int taskId, String fieldName, dynamic fieldValue) async { 
-    try {
-      if (taskId < 0) {
-        
-        final index = _cachedTasks.indexWhere((t) => t.id == taskId); 
-        if (index != -1 && fieldName == 'name') { 
-          _cachedTasks[index] = _cachedTasks[index].editName(name: fieldValue.toString()); 
-          emit(KanbanLoaded(List.from(_cachedTasks), Map.from(_folders)));
-          await _saveLocalTasks();
-        }
-        return;
-      }
-
-      final success = await apiService.saveTaskField(taskId, fieldName, fieldValue); 
-      if (success) { 
-        final index = _cachedTasks.indexWhere((t) => t.id == taskId); 
-        if (index != -1 && fieldName == 'name') { 
-          _cachedTasks[index] = _cachedTasks[index].editName(name: fieldValue.toString()); 
-          emit(KanbanLoaded(List.from(_cachedTasks), Map.from(_folders)));
-        }
-      } else { 
-        emit(KanbanError("Сервер не подтвердил сохранение.")); 
-      }
-    } catch (e) { 
-      emit(KanbanError("Сбой синхронизации: $e")); 
-    }
-  }
-
+  // Создание новой задачи в конкретной колонке (пока только локально)
   Future<void> addTask(int folderId) async {
     try {
-      const String defaultName = "Новая задача";
-      final columnTasks = _cachedTasks.where((t) => t.parentId == folderId).toList();
-      
-      
-      final int newOrder = columnTasks.isEmpty ? 1 : columnTasks.map((t) => t.order).reduce((a, b) => a < b ? a : b) - 1;
+      final columnTasks = _cachedTasks.where((t) => t.parentId == folderId);
+      final int newOrder = columnTasks.isEmpty 
+          ? 1 
+          : columnTasks.map((t) => t.order).fold(columnTasks.first.order, (min, e) => e < min ? e : min) - 1;
 
-      final tempTask = Task(id: -DateTime.now().millisecondsSinceEpoch, parentId: folderId, name: defaultName, order: newOrder);
-      _cachedTasks.add(tempTask);
+      final tempTask = Task(id: -DateTime.now().millisecondsSinceEpoch, parentId: folderId, name: "Новая задача", order: newOrder);
       
+      _cachedTasks
+        ..add(tempTask)
+        ..sort((a, b) => a.order.compareTo(b.order));
       
-      _cachedTasks.sort((a, b) => a.order.compareTo(b.order));
-      
-      emit(KanbanLoaded(List.from(_cachedTasks), Map.from(_folders)));
-      
-      
+      _emitLoaded();
       await _saveLocalTasks();
     } catch (e) {
       emit(KanbanError("Ошибка при добавлении задачи"));
     }
   }
 
-  Future<void> deleteFolder(int folderId) async {
+  // Удаление задачи (с сервера, если ID положительный, иначе только из кэша)
+  Future<void> deleteTask(int taskId) async {
+    final previousTasks = List<Task>.from(_cachedTasks);
     try {
-      
-      _folders.remove(folderId);
-      
-      
-      
-      _cachedTasks.removeWhere((t) => t.parentId == folderId);
-      
-      
-      emit(KanbanLoaded(List.from(_cachedTasks), Map.from(_folders)));
+      _cachedTasks.removeWhere((t) => t.id == taskId);
+      _emitLoaded();
 
-      final prefs = await SharedPreferences.getInstance();
-      
-      
-      final String? savedNamesRaw = prefs.getString(_storageKey);
-      if (savedNamesRaw != null) {
-        Map<String, dynamic> savedNames = jsonDecode(savedNamesRaw);
-        savedNames.remove(folderId.toString());
-        await prefs.setString(_storageKey, jsonEncode(savedNames));
+      if (taskId < 0) {
+        await _saveLocalTasks();
+        return;
       }
 
+      final success = await apiService.deleteTask(taskId);
+      if (!success) throw Exception("Не удалось удалить на сервере.");
       
-      await _saveLocalTasks();
-
     } catch (e) {
-      emit(KanbanError("Ошибка при удалении папки"));
-      
+      _cachedTasks = previousTasks;
+      emit(KanbanError("Сбой при удалении."));
+      _emitLoaded();
+    }
+  }
+
+  // Сохранение изменений в полях задачи (синхронизация с сервером и памятью)
+  Future<void> taskSave(int taskId, String fieldName, dynamic fieldValue) async { 
+    try {
+      if (taskId > 0) {
+        final success = await apiService.saveTaskField(taskId, fieldName, fieldValue); 
+        if (!success) {
+          emit(KanbanError("Сервер не подтвердил сохранение."));
+          return;
+        }
+      }
+
+      final index = _cachedTasks.indexWhere((t) => t.id == taskId); 
+      if (index != -1 && fieldName == 'name') { 
+        _cachedTasks[index] = _cachedTasks[index].copyWith(name: fieldValue.toString()); 
+        _emitLoaded();
+        if (taskId < 0) await _saveLocalTasks();
+      }
+    } catch (e) { 
+      emit(KanbanError("Сбой синхронизации: $e")); 
+    }
+  }
+
+  // Создание новой пустой колонки (папки) локально
+  Future<void> addFolder(String name) async {
+    final previousFolders = Map<int, String>.from(_folders);
+    try {
+      final tempId = -DateTime.now().millisecondsSinceEpoch;
+      _folders = {tempId: name, ..._folders};
+      _emitLoaded();
+
+      final savedNames = await _getSavedFolders();
+      savedNames[tempId.toString()] = name;
+      await _updateSavedFolders(savedNames);
+    } catch (e) {
+      _folders = previousFolders;
+      emit(KanbanError('Ошибка в создании папки'));
+      _emitLoaded();
+    }
+  }
+
+  // Логика перемещения задачи (Drag-and-Drop) с пересчетом порядковых номеров
+  Future<void> moveTask(Task task, int newParentId, int newOrder) async { 
+    final previousTasks = List<Task>.from(_cachedTasks); 
+    final oldParent = task.parentId; 
+    final oldOrder = task.order; 
+
+    // Расчет корректного индекса в пределах новой колонки
+    final targetColTasks = _cachedTasks.where((t) => t.parentId == newParentId && t.id != task.id).toList();
+    int maxAllowedOrder = targetColTasks.length + 1;
+    int finalOrder = newOrder.clamp(1, maxAllowedOrder);
+
+    if (oldParent == newParentId && oldOrder == finalOrder) return; 
+
+    try {
+      final List<Task> toUpdate = []; 
+      _cachedTasks.removeWhere((t) => t.id == task.id); 
+
+      if (oldParent == newParentId) { 
+        // Логика смещения внутри одной колонки
+        final movingDown = oldOrder < finalOrder;
+
+        for (int i = 0; i < _cachedTasks.length; i++) {
+          var t = _cachedTasks[i];
+          if (t.parentId == oldParent) {
+            if (movingDown && t.order > oldOrder && t.order <= finalOrder) {
+              _cachedTasks[i] = t.copyWith(order: t.order - 1);
+              toUpdate.add(_cachedTasks[i]);
+            } 
+            else if (!movingDown && t.order >= finalOrder && t.order < oldOrder) {
+              _cachedTasks[i] = t.copyWith(order: t.order + 1);
+              toUpdate.add(_cachedTasks[i]);
+            }
+          }
+        }
+      } else { 
+        // Логика перемещения между разными колонками
+        for (int i = 0; i < _cachedTasks.length; i++) { 
+          var t = _cachedTasks[i]; 
+          if (t.parentId == oldParent && t.order > oldOrder) { 
+            _cachedTasks[i] = t.copyWith(order: t.order - 1); 
+            toUpdate.add(_cachedTasks[i]); 
+          } 
+          else if (t.parentId == newParentId && t.order >= finalOrder) { 
+            _cachedTasks[i] = t.copyWith(order: t.order + 1); 
+            toUpdate.add(_cachedTasks[i]); 
+          }
+        }
+      }
+
+      // Обновление локального списка и уведомление UI
+      final updatedTask = task.copyWith(parentId: newParentId, order: finalOrder); 
+      _cachedTasks.add(updatedTask); 
+      toUpdate.add(updatedTask); 
+      _cachedTasks.sort((a, b) => a.order.compareTo(b.order)); 
+      _emitLoaded();
+
+      // Сохранение изменений на сервере и в памяти устройства
+      for (var t in toUpdate.where((t) => t.id > 0)) { 
+        if (t.id == task.id && oldParent != newParentId) { 
+          await apiService.saveTaskField(t.id, 'parent_id', newParentId); 
+        }
+        await apiService.saveTaskField(t.id, 'order', t.order); 
+      }
+      await _saveLocalTasks(); 
+    } catch (e) { 
+      // Откат изменений при ошибке
+      _cachedTasks = previousTasks; 
+      emit(KanbanError("Сбой синхронизации.")); 
+      _emitLoaded();
     }
   }
 }
